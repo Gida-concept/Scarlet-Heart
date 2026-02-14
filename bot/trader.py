@@ -1,6 +1,5 @@
-# bot/trader.py
-
 import time
+import pandas as pd
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 from config.settings import MIN_TRADE_USD, POLL_INTERVAL_SECONDS, BASE_CURRENCY, SYMBOLS
@@ -80,36 +79,55 @@ class Trader:
                 self._open_trade(symbol)
                 return  # Stop scanning, we found a trade
 
+    # --- CORRECTED FUNCTION START ---
     def _open_trade(self, symbol: str):
         self.logger.info("Opening trade for %s", symbol)
-        self.client.cancel_open_orders(symbol)
+        try:
+            self.client.cancel_open_orders(symbol)
+            
+            # --- ATTEMPT THE TRADE ---
+            order = self.client.market_buy(symbol, MIN_TRADE_USD)
+            
+            # --- PROCESS SUCCESSFUL ORDER ---
+            fills = order.get("fills", [])
+            if not fills:
+                self.logger.error("Market buy for %s created no fills. Aborting trade.", symbol)
+                return
 
-        order = self.client.market_buy(symbol, MIN_TRADE_USD)
-        if not order:
+            total_qty = sum(float(f["qty"]) for f in fills)
+            total_spent = sum(float(f["qty"]) * float(f["price"]) for f in fills)
+            entry_price = total_spent / total_qty if total_qty else 0
+
+            # If we can't determine an entry price, something is wrong.
+            if not entry_price:
+                self.logger.error("Could not determine entry price from fills. Aborting trade.")
+                return
+
+            # --- SET STATE ONLY AFTER SUCCESS ---
+            sl_price = calculate_sl_price(entry_price)
+            tp_price = calculate_tp_price(entry_price)
+            auto_close_price = calculate_auto_close_price(entry_price)
+
+            self.trade = {
+                "qty": total_qty,
+                "entry_price": entry_price,
+                "sl_price": sl_price,
+                "tp_price": tp_price,
+                "auto_close_price": auto_close_price,
+            }
+            self.in_trade = True
+            self.active_symbol = symbol
+
+            self.logger.info("Successfully opened trade for %s at %s", symbol, entry_price)
+            self.notifier.notify_new_trade(
+                symbol, entry_price, total_qty, sl_price, tp_price
+            )
+
+        except Exception as e:
+            self.logger.exception("Failed to execute open trade for %s. Error: %s", symbol, e)
+            # self.in_trade remains False. The bot will try again on the next cycle.
             return
-
-        fills = order.get("fills", [])
-        total_qty = sum(float(f["qty"]) for f in fills)
-        total_spent = sum(float(f["qty"]) * float(f["price"]) for f in fills)
-        entry_price = total_spent / total_qty if total_qty else 0
-
-        sl_price = calculate_sl_price(entry_price)
-        tp_price = calculate_tp_price(entry_price)
-        auto_close_price = calculate_auto_close_price(entry_price)
-
-        self.trade = {
-            "qty": total_qty,
-            "entry_price": entry_price,
-            "sl_price": sl_price,
-            "tp_price": tp_price,
-            "auto_close_price": auto_close_price,
-        }
-        self.in_trade = True
-        self.active_symbol = symbol
-
-        self.notifier.notify_new_trade(
-            symbol, entry_price, total_qty, sl_price, tp_price
-        )
+    # --- CORRECTED FUNCTION END ---
 
     def _monitor_active_trade(self):
         symbol = self.active_symbol
@@ -128,40 +146,51 @@ class Trader:
         elif current_price >= t["auto_close_price"]:
             self._close_trade("Auto-Close", current_price)
 
+    # --- CORRECTED FUNCTION START ---
     def _close_trade(self, reason: str, trigger_price: float):
         symbol = self.active_symbol
-        self.logger.info("Closing %s (%s) at %s", symbol, reason, trigger_price)
+        self.logger.info("Attempting to close %s (%s) at %s", symbol, reason, trigger_price)
+        
+        try:
+            self.client.cancel_open_orders(symbol)
 
-        self.client.cancel_open_orders(symbol)
-        sell_order = self.client.market_sell(symbol, self.trade["qty"])
+            # --- ATTEMPT TO SELL ---
+            sell_order = self.client.market_sell(symbol, self.trade["qty"])
 
-        if not sell_order:
-            self.logger.error("Failed to sell %s. Manual intervention needed.", symbol)
+            # --- PROCESS SUCCESSFUL SALE ---
+            fills = sell_order.get("fills", [])
+            if not fills:
+                self.logger.error("Market sell for %s created no fills. State not reset.", symbol)
+                # We don't reset state, so the bot will try again.
+                return
+            
+            total_qty = sum(float(f["qty"]) for f in fills)
+            total_return = sum(float(f["qty"]) * float(f["price"]) for f in fills)
+            exit_price = total_return / total_qty if total_qty else trigger_price
+
+            pnl_percent = (exit_price / self.trade["entry_price"] - 1) * 100
+            balance = self.client.get_balance(BASE_CURRENCY)
+
+            # --- NOTIFY AND RESET STATE ONLY AFTER SUCCESS ---
+            if reason == "TP":
+                self.notifier.notify_tp_hit(symbol, exit_price, pnl_percent, balance)
+            elif reason == "SL":
+                self.notifier.notify_sl_hit(symbol, exit_price, pnl_percent, balance)
+            else:
+                self.notifier.notify_auto_close(symbol, exit_price, pnl_percent, balance)
+
+            # Reset state
+            self.reference_prices[symbol] = exit_price
+            self.in_trade = False
+            self.active_symbol = None
+            self.trade = {}
+            self.logger.info("Trade closed successfully. Resuming scan.")
+
+        except Exception as e:
+            self.logger.exception("Failed to execute close trade for %s. Will retry. Error: %s", symbol, e)
+            # We DO NOT reset state here, forcing a retry on the next cycle.
             return
-
-        fills = sell_order.get("fills", [])
-        total_qty = sum(float(f["qty"]) for f in fills)
-        total_return = sum(float(f["qty"]) * float(f["price"]) for f in fills)
-        exit_price = total_return / total_qty if total_qty else trigger_price
-
-        pnl_percent = (exit_price / self.trade["entry_price"] - 1) * 100
-        balance = self.client.get_balance(BASE_CURRENCY)
-
-        if reason == "TP":
-            self.notifier.notify_tp_hit(symbol, exit_price, pnl_percent, balance)
-        elif reason == "SL":
-            self.notifier.notify_sl_hit(symbol, exit_price, pnl_percent, balance)
-        else:
-            self.notifier.notify_auto_close(symbol, exit_price, pnl_percent, balance)
-
-        # Reset state
-        # The exit price becomes the new reference for this symbol
-        self.reference_prices[symbol] = exit_price
-
-        self.in_trade = False
-        self.active_symbol = None
-        self.trade = {}
-        self.logger.info("Trade closed. Resuming scan.")
+    # --- CORRECTED FUNCTION END ---
 
 
 if __name__ == "__main__":
